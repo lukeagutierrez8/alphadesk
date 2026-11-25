@@ -15,6 +15,7 @@ import numpy as np
 
 from . import dsl, ops, pit, stats, synth
 from .evaluator import Desk
+from .thresholdout import new_salt
 from .triallog import TrialLog
 
 REASON = {"counterparty": "investors slow to update", "edge_type": "behavioral", "decay": "months"}
@@ -144,10 +145,44 @@ class Exam:
                     f"{v1['summary']} | {v2['summary']}")
 
     def determinism(self):
-        a = self.desk("det_a").submit(card("quality", "cs_rank(quality)", "quality"), campaign="d")
-        b = self.desk("det_b").submit(card("quality", "cs_rank(quality)", "quality"), campaign="d")
+        # the validation salt is random per campaign; give both desks the same one
+        salt = new_salt()
+        da, db = self.desk("det_a"), self.desk("det_b")
+        for d in (da, db):
+            d.log.write({"kind": "thresholdout", "campaign": "d", "salt": salt})
+        a = da.submit(card("quality", "cs_rank(quality)", "quality"), campaign="d")
+        b = db.submit(card("quality", "cs_rank(quality)", "quality"), campaign="d")
         same = [c["detail"] for c in a["checks"]] == [c["detail"] for c in b["checks"]]
         self.record("determinism", same, "the same card on two fresh desks", "identical" if same else "differs")
+
+    def _spend_budget(self, d, campaign):
+        # dev and validation answers far apart: every query spends budget
+        for i in range(10_000):
+            if d.validate(campaign, f"probe_{i}", 0.5, -0.5)["budget_left"] <= 0:
+                return i + 1
+        return None
+
+    def validation_budget(self):
+        d = self.desk("budget")
+        n = self._spend_budget(d, "vb")
+        v = d.submit(card("quality", "cs_rank(quality)", "quality"), campaign="vb")
+        c8 = next((c for c in v["checks"] if c["n"] == 8), None)
+        ok = n is not None and v["died_at"] == 8 and c8 is not None and c8["detail"] == "validation budget spent"
+        self.record("validation_budget", ok, "spend the validation budget, then submit a planted signal",
+                    f"budget spent after {n} queries; next card {v['summary']}")
+
+    def validation_restart(self):
+        a = self.desk("restart")
+        a.validate("vr", "probe_a", 0.5, -0.5)
+        b = self.desk("restart")                       # a second desk on the same trial log
+        ta, tb = a.thresholdout("vr"), b.thresholdout("vr")
+        qb = b.validate("vr", "probe_b", 0.5, -0.5)
+        qa = a.validate("vr", "probe_c", 0.5, -0.5)
+        salts = {e["salt"] for e in a.log.entries("vr", kind="thresholdout")}
+        ok = (ta.salt == tb.salt and len(salts) == 1 and ta.budget == tb.budget
+              and qa["budget_left"] == qb["budget_left"] - 1 == ta.total - 3)
+        self.record("validation_restart", ok, "two desks on the same trial log",
+                    f"one salt ({len(salts)} written), budget left {qa['budget_left']} of {ta.total} after 3 queries")
 
     def novelty_known(self):
         d = self.desk("lib")
@@ -168,7 +203,7 @@ class Exam:
         exams = [self.noise_1000, self.noise_campaign, self.planted_found, self.planted_short,
                  self.leaking_oracle, self.shift_ops, self.broken_operator, self.mutations,
                  self.rediscover_momentum, self.novelty_known, self.bad_ideas, self.pbo_family,
-                 self.determinism]
+                 self.determinism, self.validation_budget, self.validation_restart]
         for e in exams:
             t0 = time.time()
             e()

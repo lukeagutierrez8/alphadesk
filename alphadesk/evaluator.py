@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from . import dsl, pit, portfolio, stats
-from .thresholdout import Thresholdout
+from .thresholdout import Thresholdout, new_salt
 from .triallog import TrialLog
 
 EDGE_TYPES = {"risk_premium", "structural", "behavioral", "informational", "analytical"}
@@ -73,7 +73,11 @@ class Desk:
 
     def __post_init__(self):
         self.w = Windows.from_panel(self.panel)
-        self.tho = Thresholdout(seed=self.seed)
+        # one validation budget per campaign, rebuilt from the trial log
+        self.tho = {}
+        for c in sorted({e.get("campaign") for e in self.log.entries()
+                         if e.get("kind") in ("thresholdout", "validation")}):
+            self.thresholdout(c, create=False)
         self._lib_cache = None
         self._ret = self.panel.returns()
 
@@ -87,6 +91,32 @@ class Desk:
                 out[name] = {"returns": ls["gross"], "signal": dsl.compile_signal(f, self.panel), "values": sig}
             self._lib_cache = out
         return self._lib_cache
+
+    # ------------------------------------------------------------ validation
+    def thresholdout(self, campaign: str, create: bool = True) -> Thresholdout | None:
+        """The campaign's Thresholdout, rebuilt from the trial log so every Desk
+        on the same log shares one salt and one budget. On first use the salt
+        is generated and written to the log."""
+        salts = self.log.entries(campaign, kind="thresholdout")
+        if salts:
+            salt = salts[0]["salt"]
+        elif create:
+            salt = new_salt()
+            self.log.write({"kind": "thresholdout", "campaign": campaign, "salt": salt})
+        else:
+            return None
+        vals = self.log.entries(campaign, kind="validation")
+        tho = Thresholdout(salt, used=sum(bool(e.get("overfit_flag")) for e in vals), queries=len(vals))
+        self.tho[campaign] = tho
+        return tho
+
+    def validate(self, campaign: str, card_id, dev_value: float, valid_value: float) -> dict:
+        """Ask the campaign's validation window once and log the query."""
+        q = self.thresholdout(campaign).query(dev_value, valid_value)
+        self.log.write({"kind": "validation", "campaign": campaign, "card": card_id,
+                        "answer": q["value"], "overfit_flag": q["overfit_flag"],
+                        **({"exhausted": True} if q.get("exhausted") else {})})
+        return q
 
     # ------------------------------------------------------------ helpers
     def _ic(self, sig, h, a, b):
@@ -282,11 +312,12 @@ class Desk:
         ic_wo_best = ic_wo_best[np.isfinite(ic_wo_best)]
         t_wo = float(ic_wo_best.mean() / (ic_wo_best.std(ddof=1) / math.sqrt(len(ic_wo_best))))
         ic_valid = float(np.nanmean(self._ic(S, hold, w.valid_start, w.cutoff)))
-        q = self.tho.query(s3["mean"], ic_valid)
-        self.log.write({"kind": "validation", "campaign": campaign, "card": card.get("id"),
-                        "answer": q["value"], "overfit_flag": q["overfit_flag"]})
+        q = self.validate(campaign, card.get("id"), s3["mean"], ic_valid)
         verdict["subperiods"] = subs
         verdict["validation"] = q
+        if q.get("exhausted"):
+            done(8, "fail", "validation budget spent")
+            return self._finish(verdict, card, campaign, sig, S, hold, ls["net"])
         if len(set(signs)) > 1 or t_wo < 2.0:
             done(8, "fail", f"subperiod signs {['+' if s > 0 else '-' for s in signs]}, t without best {t_wo:.1f}")
             return self._finish(verdict, card, campaign, sig, S, hold, ls["net"])
